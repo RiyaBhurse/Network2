@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""bserve ROOT PORT -- binary HTTP-like file server. See SPEC.md."""
+import mimetypes
+import os
+import socket
+import sys
+import threading
+
+from bprotocol import (
+    FLAG_END_STREAM,
+    TYPE_DATA,
+    TYPE_HEADERS,
+    FrameError,
+    decode_headers,
+    encode_headers,
+    read_known_frame,
+    send_frame,
+)
+
+
+def send_response(conn, status, body, content_type):
+    header_pairs = [
+        (":status", str(status)),
+        ("content-type", content_type),
+        ("content-length", str(len(body))),
+        ("server", "bserve/1.0"),
+    ]
+    payload = encode_headers(header_pairs)
+    send_frame(conn, TYPE_HEADERS, 0 if body else FLAG_END_STREAM, payload)
+    if body:
+        send_frame(conn, TYPE_DATA, FLAG_END_STREAM, body)
+
+
+def send_error(conn, status, message):
+    send_response(conn, status, message.encode("ascii"), "text/plain")
+
+
+def resolve_path(root, requested_path):
+    """Map a request :path to a file under root. Returns abs path or None if disallowed/missing."""
+    rel = requested_path.lstrip("/")
+    if rel == "":
+        rel = "index.html"
+    rootabs = os.path.abspath(root)
+    candidate = os.path.abspath(os.path.join(rootabs, rel))
+    if not (candidate == rootabs or candidate.startswith(rootabs + os.sep)):
+        return None  # path traversal attempt
+    if not os.path.isfile(candidate):
+        return None
+    return candidate
+
+
+def handle_client(conn, addr, root):
+    peer = f"{addr[0]}:{addr[1]}"
+    try:
+        while True:
+            frame = read_known_frame(conn, {TYPE_HEADERS, TYPE_DATA})
+            if frame is None:
+                break  # client closed the connection cleanly
+            type_, _flags, payload = frame
+            if type_ != TYPE_HEADERS:
+                print(f"[bserve] {peer}: expected HEADERS to start a request, got type 0x{type_:02x}")
+                send_error(conn, 400, "expected HEADERS frame to start a request")
+                break
+            try:
+                headers = decode_headers(payload)
+            except FrameError as e:
+                print(f"[bserve] {peer}: malformed request frame: {e}")
+                send_error(conn, 400, f"malformed request frame: {e}")
+                break
+            hd = {}
+            for name, value in headers:
+                try:
+                    hd[name] = value.decode("ascii")
+                except UnicodeDecodeError:
+                    send_error(conn, 400, "non-ascii header value")
+                    conn.close()
+                    return
+            method = hd.get(":method")
+            path = hd.get(":path")
+            if method != "GET" or not path:
+                print(f"[bserve] {peer}: missing/unsupported :method or :path")
+                send_error(conn, 400, "missing or unsupported :method/:path")
+                break
+            full = resolve_path(root, path)
+            if full is None:
+                print(f"[bserve] {peer}: GET {path} -> 404")
+                send_response(conn, 404, b"404 Not Found", "text/plain")
+                continue  # keep the connection open for the next request
+            with open(full, "rb") as f:
+                body = f.read()
+            ctype, _ = mimetypes.guess_type(full)
+            ctype = ctype or "application/octet-stream"
+            print(f"[bserve] {peer}: GET {path} -> 200 ({len(body)} bytes, {ctype})")
+            send_response(conn, 200, body, ctype)
+            # loop back: connection stays open (keep-alive) for the next request frame
+    except (ConnectionError, OSError) as e:
+        print(f"[bserve] {peer}: connection error: {e}")
+    finally:
+        conn.close()
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: bserve <root-dir> <port>", file=sys.stderr)
+        sys.exit(1)
+    root, port = sys.argv[1], int(sys.argv[2])
+    if not os.path.isdir(root):
+        print(f"bserve: root directory not found: {root}", file=sys.stderr)
+        sys.exit(1)
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(16)
+    print(f"bserve: serving {os.path.abspath(root)} on port {port}")
+
+    try:
+        while True:
+            conn, addr = srv.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr, root), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.close()
+
+
+if __name__ == "__main__":
+    main()

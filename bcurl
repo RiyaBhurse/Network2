@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""bcurl [-v] host:port/path -- binary HTTP-like client. See SPEC.md."""
+import socket
+import sys
+
+from bprotocol import (
+    FLAG_END_STREAM,
+    TYPE_DATA,
+    TYPE_HEADERS,
+    FrameError,
+    decode_headers,
+    encode_headers,
+    hexdump,
+    pack_frame_header,
+    read_known_frame,
+)
+
+
+def vlog(verbose, *args):
+    if verbose:
+        print(*args, file=sys.stderr)
+
+
+def dump_frame(verbose, direction, type_, flags, payload, type_name):
+    if not verbose:
+        return
+    header_bytes = pack_frame_header(len(payload), type_, flags)
+    print(
+        f"{direction} FRAME {type_name} (type=0x{type_:02x} flags=0x{flags:02x} len={len(payload)})",
+        file=sys.stderr,
+    )
+    print(hexdump(header_bytes + payload, indent="    "), file=sys.stderr)
+
+
+def parse_target(target):
+    if target.startswith("http://"):
+        target = target[len("http://"):]
+    if "/" in target:
+        hostport, rest = target.split("/", 1)
+        path = "/" + rest
+    else:
+        hostport, path = target, "/"
+    if ":" in hostport:
+        host, port_s = hostport.split(":", 1)
+        port = int(port_s)
+    else:
+        host, port = hostport, 80
+    return host, port, path
+
+
+def main():
+    args = sys.argv[1:]
+    verbose = "-v" in args
+    if verbose:
+        args.remove("-v")
+    if len(args) != 1:
+        print("usage: bcurl [-v] host:port/path", file=sys.stderr)
+        sys.exit(2)
+
+    host, port, path = parse_target(args[0])
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((host, port))
+    except OSError as e:
+        print(f"bcurl: cannot connect to {host}:{port}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    req_payload = encode_headers([
+        (":method", "GET"),
+        (":path", path),
+        ("host", f"{host}:{port}"),
+        ("user-agent", "bcurl/1.0"),
+    ])
+    header_bytes = pack_frame_header(len(req_payload), TYPE_HEADERS, FLAG_END_STREAM)
+    dump_frame(verbose, "-->", TYPE_HEADERS, FLAG_END_STREAM, req_payload, "HEADERS (request)")
+    try:
+        sock.sendall(header_bytes + req_payload)
+    except OSError as e:
+        print(f"bcurl: send failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        frame = read_known_frame(sock, {TYPE_HEADERS, TYPE_DATA})
+    except (ConnectionError, FrameError) as e:
+        print(f"bcurl: error reading response: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if frame is None:
+        print("bcurl: server closed the connection without responding", file=sys.stderr)
+        sys.exit(1)
+
+    type_, flags, payload = frame
+    dump_frame(verbose, "<--", type_, flags, payload, "HEADERS (response)")
+    if type_ != TYPE_HEADERS:
+        print(f"bcurl: expected HEADERS frame from server, got type 0x{type_:02x}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        headers = decode_headers(payload)
+    except FrameError as e:
+        print(f"bcurl: malformed response headers: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    hd = {name: value.decode("ascii", errors="replace") for name, value in headers}
+    try:
+        status = int(hd.get(":status", "0"))
+    except ValueError:
+        status = 0
+    vlog(verbose, f"status={status} headers={hd}")
+
+    body = b""
+    if not (flags & FLAG_END_STREAM):
+        try:
+            frame2 = read_known_frame(sock, {TYPE_HEADERS, TYPE_DATA})
+        except (ConnectionError, FrameError) as e:
+            print(f"bcurl: error reading body: {e}", file=sys.stderr)
+            sys.exit(1)
+        if frame2 is not None:
+            type2, flags2, payload2 = frame2
+            dump_frame(verbose, "<--", type2, flags2, payload2, "DATA (response body)")
+            if type2 == TYPE_DATA:
+                body = payload2
+
+    sock.close()  # one request per invocation; bcurl never opens a second connection
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+    sys.exit(1 if status >= 400 else 0)
+
+
+if __name__ == "__main__":
+    main()
