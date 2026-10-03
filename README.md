@@ -33,3 +33,4 @@ is the shared frame/header codec both import.
 | `bserve`, `bcurl`, `bprotocol.py` | The implementation — deliverable #2 |
 | `hexdump_annotated.md` | Annotated capture of one full request/response — deliverable #3 |
 | `www/` | Sample files served by `bserve` |
+# Network2
